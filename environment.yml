@@ -1,0 +1,29 @@
+name: sight
+channels:
+  - conda-forge
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - scipy
+  - matplotlib
+  - pillow
+  - pyyaml
+  - requests
+  - tqdm
+  - scikit-image
+  - ipywidgets
+  - ipykernel
+  - pip:
+    - torch
+    - torchvision
+    - torchaudio
+    - filelock
+    - fire
+    - humanize
+    - blobfile
+    - clip @ git+https://github.com/openai/CLIP.git
+    - -e .
+
