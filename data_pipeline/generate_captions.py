@@ -128,9 +128,12 @@ def main():
         "image-text-to-text",
         model=MODEL_ID,
         device_map="auto",
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
+        model_kwargs={
+            "attn_implementation": "flash_attention_2",
+        },
+        tokenizer_kwargs={"padding_side": "left"},
         trust_remote_code=True,
-        model_kwargs={"attn_implementation": "flash_attention_2"},
     )
 
     print(f"[{RANK}] Starting inference on {len(remaining_indices)} items...")
@@ -184,7 +187,14 @@ def main():
 
             # Write Results
             for j, output in enumerate(outputs):
-                generated_text = output[0]["generated_text"].strip()
+                # Pipeline returns list of dicts, get the generated text
+                if isinstance(output, list) and len(output) > 0:
+                    generated_text = output[0].get("generated_text", "").strip()
+                elif isinstance(output, dict):
+                    generated_text = output.get("generated_text", "").strip()
+                else:
+                    generated_text = str(output).strip()
+
                 record = {"id": metadata[j]["id"], "label": metadata[j]["label"], "description": generated_text}
                 f_out.write(json.dumps(record) + "\n")
 
