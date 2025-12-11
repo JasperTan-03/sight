@@ -7,7 +7,7 @@ import numpy as np
 from PIL import Image
 import torch
 from tqdm.auto import tqdm
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from transformers import pipeline
 
 # --- Configuration ---
 MODEL_ID = "Qwen/Qwen2.5-VL-32B-Instruct"
@@ -120,18 +120,18 @@ def main():
         print(f"[{RANK}] All samples already processed!")
         return
 
-    # Initialize model
+    # Initialize pipeline
     print(f"[{RANK}] Loading model: {MODEL_ID}...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model = Qwen2VLForConditionalGeneration.from_pretrained(
-        MODEL_ID,
-        torch_dtype=torch.bfloat16,
+    pipe = pipeline(
+        "image-text-to-text",
+        model=MODEL_ID,
         device_map="auto",
+        torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        attn_implementation="flash_attention_2",
+        model_kwargs={"attn_implementation": "flash_attention_2"},
     )
-    processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
 
     print(f"[{RANK}] Starting inference on {len(remaining_indices)} items...")
 
@@ -170,36 +170,22 @@ def main():
                     }
                 ]
                 messages_list.append(messages)
-                metadata.append({"id": folder_name, "label": label, "image": image})
+                metadata.append({"id": folder_name, "label": label})
 
-            # Process batch
-            texts = [processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=True) for msg in messages_list]
-            images = [m["image"] for m in metadata]
-
-            inputs = processor(
-                text=texts,
-                images=images,
-                padding=True,
-                return_tensors="pt",
-            ).to(device)
-
-            # Generate
-            with torch.no_grad():
-                generated_ids = model.generate(
-                    **inputs,
-                    max_new_tokens=200,
-                    do_sample=True,
-                    temperature=0.2,
-                    top_p=0.9,
-                )
-
-            # Decode outputs (skip input tokens)
-            generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
-            outputs = processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            # Run batch inference with pipeline
+            outputs = pipe(
+                text=messages_list,
+                batch_size=batch_size,
+                max_new_tokens=200,
+                do_sample=True,
+                temperature=0.2,
+                top_p=0.9,
+            )
 
             # Write Results
-            for j, generated_text in enumerate(outputs):
-                record = {"id": metadata[j]["id"], "label": metadata[j]["label"], "description": generated_text.strip()}
+            for j, output in enumerate(outputs):
+                generated_text = output[0]["generated_text"].strip()
+                record = {"id": metadata[j]["id"], "label": metadata[j]["label"], "description": generated_text}
                 f_out.write(json.dumps(record) + "\n")
 
             batch_count += 1
