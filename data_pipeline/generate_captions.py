@@ -187,23 +187,24 @@ def main():
 
             # Write Results
             for j, output in enumerate(outputs):
-                # Pipeline returns nested structure, extract the text carefully
+                # Pipeline returns: [{'input_text': [...], 'generated_text': [user_msg, assistant_msg]}]
                 try:
-                    if isinstance(output, list):
-                        # If output is a list, drill down
-                        current = output
-                        while isinstance(current, list) and len(current) > 0:
-                            current = current[0]
-                        if isinstance(current, dict):
-                            generated_text = current.get("generated_text", "").strip()
+                    if isinstance(output, list) and len(output) > 0:
+                        output_dict = output[0]
+                        generated_messages = output_dict.get("generated_text", [])
+                        # The assistant response is the last message in the list
+                        if isinstance(generated_messages, list) and len(generated_messages) > 0:
+                            assistant_msg = generated_messages[-1]
+                            if isinstance(assistant_msg, dict) and assistant_msg.get("role") == "assistant":
+                                generated_text = assistant_msg.get("content", "").strip()
+                            else:
+                                generated_text = str(assistant_msg).strip()
                         else:
-                            generated_text = str(current).strip()
-                    elif isinstance(output, dict):
-                        generated_text = output.get("generated_text", "").strip()
+                            generated_text = ""
                     else:
                         generated_text = str(output).strip()
                 except Exception as e:
-                    print(f"[{RANK}] Error parsing output {j}: {e}, output type: {type(output)}, output: {output}")
+                    print(f"[{RANK}] Error parsing output {j}: {e}")
                     generated_text = ""
 
                 record = {"id": metadata[j]["id"], "label": metadata[j]["label"], "description": generated_text}
