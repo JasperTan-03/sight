@@ -5,7 +5,9 @@ from pathlib import Path
 import argparse
 import numpy as np
 from PIL import Image
-from vllm import LLM, SamplingParams
+import torch
+from tqdm.auto import tqdm
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 
 # --- Configuration ---
 MODEL_ID = "Qwen/Qwen2.5-VL-32B-Instruct"
@@ -19,10 +21,10 @@ if RANK == 0:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="vLLM Caption Generator")
+    parser = argparse.ArgumentParser(description="Caption Generator")
     parser.add_argument("--data_dir", type=str, required=True, help="Root data directory containing 'renders'")
     parser.add_argument("--output_dir", type=str, default="checkpoints", help="Directory for checkpoint files")
-    parser.add_argument("--loader_batch_size", type=int, default=10, help="How many images to load into RAM at once")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for inference")
     parser.add_argument("--save_every", type=int, default=10, help="Save checkpoint every N batches")
     return parser.parse_args()
 
@@ -118,33 +120,32 @@ def main():
         print(f"[{RANK}] All samples already processed!")
         return
 
-    # Initialize vLLM
-    print(f"[{RANK}] Loading vLLM model: {MODEL_ID}...")
-    llm = LLM(
-        model=MODEL_ID,
-        tokenizer_mode="mistral",
-        tensor_parallel_size=1,
-        trust_remote_code=True,
-        max_model_len=8192,
-        limit_mm_per_prompt={"image": 1},
-    )
+    # Initialize model
+    print(f"[{RANK}] Loading model: {MODEL_ID}...")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Sampling parameters
-    sampling_params = SamplingParams(max_tokens=200, temperature=0.2, top_p=0.9)
+    model = Qwen2VLForConditionalGeneration.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        trust_remote_code=True,
+        attn_implementation="flash_attention_2",
+    )
+    processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
 
     print(f"[{RANK}] Starting inference on {len(remaining_indices)} items...")
 
-    batch_size = args.loader_batch_size
+    batch_size = args.batch_size
     batch_count = 0
 
     # Open file in append mode
     with open(checkpoint_path, "a") as f_out:
-        for i in range(0, len(remaining_indices), batch_size):
+        for i in tqdm(range(0, len(remaining_indices), batch_size), desc=f"[{RANK}] Processing"):
             batch_indices = remaining_indices[i : i + batch_size]
             batch_folders = [all_folders[idx] for idx in batch_indices]
 
             # Prepare Batch Inputs
-            prompts = []
+            messages_list = []
             metadata = []
 
             for folder_path in batch_folders:
@@ -155,7 +156,7 @@ def main():
                 # Create Image
                 image = create_grid_image(folder_path)
 
-                # Construct vLLM Message
+                # Construct message
                 messages = [
                     {
                         "role": "user",
@@ -168,16 +169,37 @@ def main():
                         ],
                     }
                 ]
-                prompts.append(messages)
-                metadata.append({"id": folder_name, "label": label})
+                messages_list.append(messages)
+                metadata.append({"id": folder_name, "label": label, "image": image})
 
-            # Run Batch Inference
-            outputs = llm.chat(prompts, sampling_params=sampling_params)
+            # Process batch
+            texts = [processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=True) for msg in messages_list]
+            images = [m["image"] for m in metadata]
+
+            inputs = processor(
+                text=texts,
+                images=images,
+                padding=True,
+                return_tensors="pt",
+            ).to(device)
+
+            # Generate
+            with torch.no_grad():
+                generated_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=200,
+                    do_sample=True,
+                    temperature=0.2,
+                    top_p=0.9,
+                )
+
+            # Decode outputs (skip input tokens)
+            generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
+            outputs = processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
 
             # Write Results
-            for j, output in enumerate(outputs):
-                generated_text = output.outputs[0].text.strip()
-                record = {"id": metadata[j]["id"], "label": metadata[j]["label"], "description": generated_text}
+            for j, generated_text in enumerate(outputs):
+                record = {"id": metadata[j]["id"], "label": metadata[j]["label"], "description": generated_text.strip()}
                 f_out.write(json.dumps(record) + "\n")
 
             batch_count += 1

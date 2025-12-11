@@ -36,7 +36,7 @@ echo "Launching $SLURM_NTASKS tasks across $SLURM_NNODES nodes"
 srun python generate_captions.py \
     --data_dir "$DATA_DIR" \
     --output_dir "$OUTPUT_DIR" \
-    --loader_batch_size 20 \
+    --batch_size 4 \
     --save_every 10
 
 echo "Job Complete"
