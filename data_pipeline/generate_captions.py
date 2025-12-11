@@ -187,13 +187,24 @@ def main():
 
             # Write Results
             for j, output in enumerate(outputs):
-                # Pipeline returns list of dicts, get the generated text
-                if isinstance(output, list) and len(output) > 0:
-                    generated_text = output[0].get("generated_text", "").strip()
-                elif isinstance(output, dict):
-                    generated_text = output.get("generated_text", "").strip()
-                else:
-                    generated_text = str(output).strip()
+                # Pipeline returns nested structure, extract the text carefully
+                try:
+                    if isinstance(output, list):
+                        # If output is a list, drill down
+                        current = output
+                        while isinstance(current, list) and len(current) > 0:
+                            current = current[0]
+                        if isinstance(current, dict):
+                            generated_text = current.get("generated_text", "").strip()
+                        else:
+                            generated_text = str(current).strip()
+                    elif isinstance(output, dict):
+                        generated_text = output.get("generated_text", "").strip()
+                    else:
+                        generated_text = str(output).strip()
+                except Exception as e:
+                    print(f"[{RANK}] Error parsing output {j}: {e}, output type: {type(output)}, output: {output}")
+                    generated_text = ""
 
                 record = {"id": metadata[j]["id"], "label": metadata[j]["label"], "description": generated_text}
                 f_out.write(json.dumps(record) + "\n")
