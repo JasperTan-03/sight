@@ -1,18 +1,16 @@
 #!/bin/bash
-#SBATCH -J vllm_shard           # Job Name
-#SBATCH -o logs/vllm_%A_%a.out  # Output log
-#SBATCH -e logs/vllm_%A_%a.err  # Error log
-#SBATCH -p gh # Queue (gh-dev for testing, gh for production)
-#SBATCH -N 2                   # Something else
-#SBATCH -n 2                    # Total tasks
+#SBATCH -J vllm_caption         # Job Name
+#SBATCH -o logs/vllm_%j.out     # Output log
+#SBATCH -e logs/vllm_%j.err     # Error log
+#SBATCH -p gh                   # Queue (gh-dev for testing, gh for production)
+#SBATCH -N 2                    # Number of nodes
+#SBATCH --ntasks-per-node=1     # One task per node (1 GPU per task)
 #SBATCH --time=02:00:00         # Time limit
-#SBATCH --array=0-1             # Array range (0-9 = 10 chunks)
 #SBATCH -A OTH25007
 
 # --- Config ---
-NUM_CHUNKS=2             # Must match array size
-DATA_DIR="/work/09889/troydutton/datasets/data/renders/"
-OUTPUT_FILE="captions.jsonl"
+DATA_DIR="/work/09889/troydutton/datasets/data"
+OUTPUT_DIR="/work/09889/troydutton/datasets/data/checkpoints"
 HF_CACHE='/home1/09889/troydutton/.cache'
 
 # Source
@@ -29,13 +27,16 @@ cd /home1/09889/troydutton/work/sight/data_pipeline
 # Set Cache to Scratch (Critical on TACC)
 export HF_HOME="$HF_CACHE"
 
-echo "Launching Shard $SLURM_ARRAY_TASK_ID of $NUM_CHUNKS"
+# Create output directory
+mkdir -p "$OUTPUT_DIR"
 
-python generate_captions.py \
+echo "Launching $SLURM_NTASKS tasks across $SLURM_NNODES nodes"
+
+# Use srun to distribute work - SLURM_PROCID and SLURM_NTASKS are set automatically
+srun python generate_captions.py \
     --data_dir "$DATA_DIR" \
-    --output_file "$OUTPUT_FILE" \
-    --num_chunks $NUM_CHUNKS \
-    --chunk_idx $SLURM_ARRAY_TASK_ID \
-    --loader_batch_size 20
+    --output_dir "$OUTPUT_DIR" \
+    --loader_batch_size 20 \
+    --save_every 10
 
-echo "Shard $SLURM_ARRAY_TASK_ID Complete"
+echo "Job Complete"
