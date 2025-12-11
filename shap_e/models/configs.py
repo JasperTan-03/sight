@@ -9,6 +9,7 @@ from shap_e.models.generation.latent_diffusion import SplitVectorDiffusion
 from shap_e.models.generation.perceiver import PointDiffusionPerceiver
 from shap_e.models.generation.pooled_mlp import PooledMLP
 from shap_e.models.generation.transformer import (
+    BioMedCLIPTextDiffusionTransformer,
     CLIPImageGridPointDiffusionTransformer,
     CLIPImageGridUpsamplePointDiffusionTransformer,
     CLIPImagePointDiffusionTransformer,
@@ -121,6 +122,10 @@ def model_from_config(config: Union[str, Dict[str, Any]], device: torch.device) 
         return UpsamplePointDiffusionTransformer(device=device, dtype=torch.float32, **config)
     elif name == "CLIPImageGridUpsamplePointDiffusionTransformer":
         return CLIPImageGridUpsamplePointDiffusionTransformer(
+            device=device, dtype=torch.float32, **config
+        )
+    elif name == "BioMedCLIPTextDiffusionTransformer":
+        return BioMedCLIPTextDiffusionTransformer(
             device=device, dtype=torch.float32, **config
         )
     elif name == "SplitVectorDiffusion":
