@@ -1,66 +1,34 @@
 import os
 import glob
 import json
-from pathlib import Path
 import argparse
 import numpy as np
-from PIL import Image
 import torch
-from tqdm.auto import tqdm
-from transformers import pipeline
+from PIL import Image
+from tqdm import tqdm
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
 # --- Configuration ---
 MODEL_ID = "Qwen/Qwen2.5-VL-32B-Instruct"
 
-# Distributed settings (SLURM)
-RANK = int(os.environ.get("SLURM_PROCID", 0))
-WORLD_SIZE = int(os.environ.get("SLURM_NTASKS", 1))
-
-if RANK == 0:
-    print(f"World Size: {WORLD_SIZE}")
-
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Caption Generator")
-    parser.add_argument("--data_dir", type=str, required=True, help="Root data directory containing 'renders'")
-    parser.add_argument("--output_dir", type=str, default="checkpoints", help="Directory for checkpoint files")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for inference")
-    parser.add_argument("--save_every", type=int, default=10, help="Save checkpoint every N batches")
+    parser = argparse.ArgumentParser(description="Vista Caption Generator")
+    parser.add_argument("--data_dir", type=str, required=True, help="Root directory containing 'renders'")
+    parser.add_argument("--output_dir", type=str, default="checkpoints", help="Directory for output files")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size (Vista can likely handle 4-8)")
     return parser.parse_args()
 
 
-def get_all_folders(root_dir):
-    """Get all render folders sorted."""
-    all_folders = sorted(glob.glob(os.path.join(root_dir, "*")))
-    all_folders = [f for f in all_folders if os.path.isdir(f)]
-    return all_folders
-
-
-def get_shard_indices(total_items, world_size, rank):
-    """Split indices across ranks using numpy."""
-    all_indices = np.arange(total_items)
-    split_indices = np.array_split(all_indices, world_size)[rank]
-    print(f"[{rank}] Processing {len(split_indices)}/{total_items} samples")
-    return split_indices.tolist()
-
-
-def load_checkpoint(checkpoint_path):
-    """Load completed indices from checkpoint file."""
-    completed = set()
-    if os.path.exists(checkpoint_path):
-        print(f"[{RANK}] Loading checkpoint: {checkpoint_path}")
-        with open(checkpoint_path, "r") as f:
-            for line in f:
-                try:
-                    record = json.loads(line.strip())
-                    completed.add(record["id"])
-                except json.JSONDecodeError:
-                    continue
-        print(f"[{RANK}] Resuming with {len(completed)} completed samples")
-    return completed
+def get_dist_info():
+    """Get SLURM rank info for data sharding."""
+    rank = int(os.environ.get("SLURM_PROCID", 0))
+    world_size = int(os.environ.get("SLURM_NTASKS", 1))
+    return rank, world_size
 
 
 def create_grid_image(folder_path):
+    """Stitches 6 views into a single 3x2 grid."""
     views_map = {
         "front": "front.png",
         "back": "back.png",
@@ -69,7 +37,6 @@ def create_grid_image(folder_path):
         "top": "top.png",
         "bottom": "bottom.png",
     }
-
     imgs = {}
     for k, v in views_map.items():
         path = os.path.join(folder_path, v)
@@ -79,87 +46,87 @@ def create_grid_image(folder_path):
             imgs[k] = Image.new("RGB", (224, 224), (0, 0, 0))
 
     w, h = imgs["front"].size
+    # 3 wide, 2 tall
     grid_img = Image.new("RGB", (w * 3, h * 2))
-
     grid_img.paste(imgs["front"], (0, 0))
     grid_img.paste(imgs["right"], (w, 0))
     grid_img.paste(imgs["back"], (w * 2, 0))
     grid_img.paste(imgs["left"], (0, h))
     grid_img.paste(imgs["top"], (w, h))
     grid_img.paste(imgs["bottom"], (w * 2, h))
-
     return grid_img
 
 
 def main():
     args = parse_args()
+    rank, world_size = get_dist_info()
 
-    # Setup paths
-    render_dir = os.path.join(args.data_dir, "renders")
-    checkpoint_dir = Path(args.output_dir)
-    checkpoint_dir.mkdir(exist_ok=True)
-    checkpoint_path = checkpoint_dir / f"rank{RANK}.jsonl"
-
-    # Get all folders and split across ranks
-    all_folders = get_all_folders(render_dir)
-    if not all_folders:
-        print(f"[{RANK}] No folders found in {render_dir}")
-        return
-
-    # Get indices for this rank
-    my_indices = get_shard_indices(len(all_folders), WORLD_SIZE, RANK)
-
-    # Load checkpoint to find completed work
-    completed_ids = load_checkpoint(checkpoint_path)
-
-    # Filter remaining work
-    remaining_indices = [idx for idx in my_indices if os.path.basename(all_folders[idx]) not in completed_ids]
-    print(f"[{RANK}] Remaining samples: {len(remaining_indices)}")
-
-    if len(remaining_indices) == 0:
-        print(f"[{RANK}] All samples already processed!")
-        return
-
-    # Initialize pipeline
-    print(f"[{RANK}] Loading model: {MODEL_ID}...")
+    # 1. Setup Device (Simple for Vista: 1 GPU per task)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if rank == 0:
+        print(f"--- Vista Inference Started ---")
+        print(f"World Size: {world_size}")
+        print(f"Model: {MODEL_ID} (BF16 Full Precision)")
 
-    pipe = pipeline(
-        "image-text-to-text",
-        model=MODEL_ID,
+    # 2. Load Model (Native BF16, Flash Attention)
+    # We use device_map="auto" which puts the whole model on the single GPU efficiently
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
         device_map="auto",
-        dtype=torch.bfloat16,
-        model_kwargs={
-            "attn_implementation": "flash_attention_2",
-        },
-        tokenizer_kwargs={"padding_side": "left"},
-        trust_remote_code=True,
     )
+    processor = AutoProcessor.from_pretrained(MODEL_ID)
 
-    print(f"[{RANK}] Starting inference on {len(remaining_indices)} items...")
+    # 3. Data Sharding
+    render_dir = os.path.join(args.data_dir, "renders")
+    all_folders = sorted([f for f in glob.glob(os.path.join(render_dir, "*")) if os.path.isdir(f)])
 
-    batch_size = args.batch_size
-    batch_count = 0
+    if not all_folders:
+        print(f"[{rank}] No folders found in {render_dir}")
+        return
 
-    # Open file in append mode
-    with open(checkpoint_path, "a") as f_out:
-        for i in tqdm(range(0, len(remaining_indices), batch_size), desc=f"[{RANK}] Processing"):
-            batch_indices = remaining_indices[i : i + batch_size]
-            batch_folders = [all_folders[idx] for idx in batch_indices]
+    # Split work deterministically
+    my_indices = np.array_split(np.arange(len(all_folders)), world_size)[rank]
+    my_folders = [all_folders[i] for i in my_indices]
 
-            # Prepare Batch Inputs
-            messages_list = []
+    # 4. Checkpoint Management
+    os.makedirs(args.output_dir, exist_ok=True)
+    ckpt_path = os.path.join(args.output_dir, f"rank{rank}.jsonl")
+
+    completed_ids = set()
+    if os.path.exists(ckpt_path):
+        with open(ckpt_path, "r") as f:
+            for line in f:
+                try:
+                    completed_ids.add(json.loads(line)["id"])
+                except:
+                    pass
+
+    # Filter what's left
+    todo_folders = [f for f in my_folders if os.path.basename(f) not in completed_ids]
+    print(f"[{rank}] Processing {len(todo_folders)} items (skipped {len(completed_ids)})")
+
+    # 5. Inference Loop
+    # Write in append mode so we don't lose progress if it crashes
+    with open(ckpt_path, "a") as f_out:
+        for i in tqdm(range(0, len(todo_folders), args.batch_size), desc=f"Rank {rank}"):
+            batch_paths = todo_folders[i : i + args.batch_size]
+
+            # Prepare Batch
+            texts = []
+            images = []
             metadata = []
 
-            for folder_path in batch_folders:
-                folder_name = os.path.basename(folder_path)
+            for folder in batch_paths:
+                folder_name = os.path.basename(folder)
                 parts = folder_name.split("_", 1)
                 label = parts[1] if len(parts) > 1 else folder_name
 
-                # Create Image
-                image = create_grid_image(folder_path)
+                # Image processing
+                image = create_grid_image(folder)
 
-                # Construct message
+                # Qwen Chat Template
                 messages = [
                     {
                         "role": "user",
@@ -172,52 +139,34 @@ def main():
                         ],
                     }
                 ]
-                messages_list.append(messages)
+                # Prepare text prompt
+                text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+                texts.append(text_prompt)
+                images.append(image)
                 metadata.append({"id": folder_name, "label": label})
 
-            # Run batch inference with pipeline
-            outputs = pipe(
-                text=messages_list,
-                batch_size=batch_size,
-                max_new_tokens=200,
-                do_sample=True,
-                temperature=0.2,
-                top_p=0.9,
-            )
+            # Tokenize Batch
+            inputs = processor(text=texts, images=images, padding=True, return_tensors="pt")
+            inputs = inputs.to(model.device)
 
-            # Write Results
-            for j, output in enumerate(outputs):
-                # Pipeline returns: [{'input_text': [...], 'generated_text': [user_msg, assistant_msg]}]
-                try:
-                    if isinstance(output, list) and len(output) > 0:
-                        output_dict = output[0]
-                        generated_messages = output_dict.get("generated_text", [])
-                        # The assistant response is the last message in the list
-                        if isinstance(generated_messages, list) and len(generated_messages) > 0:
-                            assistant_msg = generated_messages[-1]
-                            if isinstance(assistant_msg, dict) and assistant_msg.get("role") == "assistant":
-                                generated_text = assistant_msg.get("content", "").strip()
-                            else:
-                                generated_text = str(assistant_msg).strip()
-                        else:
-                            generated_text = ""
-                    else:
-                        generated_text = str(output).strip()
-                except Exception as e:
-                    print(f"[{RANK}] Error parsing output {j}: {e}")
-                    generated_text = ""
+            # Generate
+            with torch.no_grad():
+                generated_ids = model.generate(**inputs, max_new_tokens=256, temperature=0.2, top_p=0.9, do_sample=True)
 
-                record = {"id": metadata[j]["id"], "label": metadata[j]["label"], "description": generated_text}
+            # Decode (Trim input tokens to fix the "empty string" or "repetition" bug)
+            generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
+            output_texts = processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+
+            # Save Results
+            for meta, desc in zip(metadata, output_texts):
+                record = {"id": meta["id"], "label": meta["label"], "description": desc.strip()}
                 f_out.write(json.dumps(record) + "\n")
 
-            batch_count += 1
+            # Flush periodically
+            f_out.flush()
 
-            # Periodic checkpoint flush
-            if batch_count % args.save_every == 0:
-                f_out.flush()
-                print(f"[{RANK}] Checkpoint: {i + len(batch_indices)}/{len(remaining_indices)} processed")
-
-    print(f"[{RANK}] Done! Saved to {checkpoint_path}")
+    print(f"[{rank}] Finished!")
 
 
 if __name__ == "__main__":
