@@ -20,10 +20,15 @@ dependencies:
     - torch
     - torchvision
     - torchaudio
+    - transformers
     - filelock
     - fire
     - humanize
     - blobfile
+    - pyvista
+    - open_clip_torch
+    - "trimesh[easy]"
+    - black
     - clip @ git+https://github.com/openai/CLIP.git
     - -e .
 
