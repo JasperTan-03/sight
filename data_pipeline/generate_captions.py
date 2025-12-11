@@ -1,4 +1,5 @@
 import os
+# penis
 import glob
 import json
 import math
@@ -9,7 +10,7 @@ from vllm import LLM, SamplingParams
 # --- Configuration ---
 # WARNING: Ensure this is a VLM (like Pixtral). Standard Mistral-Small is text-only.
 # If using Pixtral, change to: "mistralai/Pixtral-12B-2409"
-MODEL_ID = "mistralai/Mistral-Small-3.1-24B-Instruct-2503" 
+MODEL_ID = "Qwen/Qwen2.5-VL-32B-Instruct"
 
 def parse_args():
     parser = argparse.ArgumentParser(description="vLLM Caption Generator")
@@ -126,7 +127,7 @@ def main():
                         "role": "user",
                         "content": [
                             {"type": "image", "image": image},
-                            {"type": "text", "text": f"Below are 6 views of a 3D medical model labeled as '{label}'. Please provide a very detailed technical description of the geometry, structure, and any visible features or abnormalities suitable for 3D modeling."}
+                            {"type": "text", "text": f"Analyze these 6 views of a medical object labeled '{label}'. Provide a concise anatomical description focusing on specific shape, surface texture, and visible structural irregularities. Do not use introduction sentences."}
                         ]
                     }
                 ]
