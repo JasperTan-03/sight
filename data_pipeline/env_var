@@ -1,0 +1,2 @@
+MY_DATA_DIR="/scratch/10299/varumugam/medshapenetpipeline/data"
+MY_CACHE_DIR="/scratch/10299/varumugam/.cache/huggingface"
