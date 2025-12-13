@@ -1,6 +1,9 @@
 # Additional folders to ignore
 shap_e_model_cache/
 results/
+data/
+tools/
+checkpoints/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

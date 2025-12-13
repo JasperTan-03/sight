@@ -489,3 +489,200 @@ class CLIPImageGridUpsamplePointDiffusionTransformer(UpsamplePointDiffusionTrans
 
         cond = [(t_embed, self.time_token_cond), (clip_embed, True), (low_res_embed, True)]
         return self._forward_with_cond(x, cond)
+
+
+class BioMedCLIPTextDiffusionTransformer(PointDiffusionTransformer):
+    """
+    A diffusion transformer that uses pre-computed BioMedCLIP text embeddings
+    for conditioning. Designed for medical text-to-3D generation.
+    
+    BioMedCLIP (microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224) outputs:
+    - 512-dimensional embeddings
+    - Supports up to 256 tokens (vs 77 for standard CLIP)
+    
+    This class includes a trainable projection layer to bridge BioMedCLIP's
+    512-dim embeddings to Shap-E's transformer width.
+    """
+
+    # BioMedCLIP constants
+    BIOMEDCLIP_EMBED_DIM = 512
+    BIOMEDCLIP_MAX_TOKENS = 256
+
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        n_ctx: int = 1024,
+        token_cond: bool = True,  # Use token conditioning for sequence embeddings
+        cond_drop_prob: float = 0.0,
+        context_dim: int = 512,  # BioMedCLIP embedding dimension
+        use_pooled_embeddings: bool = True,  # If True, use [CLS] token; if False, use full sequence
+        max_seq_len: int = 256,  # Maximum sequence length for BioMedCLIP
+        **kwargs,
+    ):
+        """
+        Initialize the BioMedCLIP-conditioned diffusion transformer.
+        
+        Args:
+            device: The device to create tensors on.
+            dtype: The dtype for model parameters.
+            n_ctx: Number of context tokens for the point cloud.
+            token_cond: Whether to use token-based conditioning.
+            cond_drop_prob: Probability of dropping the conditioning (for CFG).
+            context_dim: Dimension of BioMedCLIP embeddings (512).
+            use_pooled_embeddings: If True, expects [B, 512] pooled embeddings.
+                                   If False, expects [B, seq_len, 512] sequence embeddings.
+            max_seq_len: Maximum sequence length when using sequence embeddings.
+        """
+        # Calculate n_ctx adjustment for sequence conditioning
+        if not use_pooled_embeddings and token_cond:
+            # Reserve space for sequence tokens
+            super().__init__(
+                device=device,
+                dtype=dtype,
+                n_ctx=n_ctx + max_seq_len,
+                pos_emb_n_ctx=n_ctx,
+                **kwargs,
+            )
+        else:
+            super().__init__(
+                device=device,
+                dtype=dtype,
+                n_ctx=n_ctx + int(token_cond),
+                pos_emb_n_ctx=n_ctx,
+                **kwargs,
+            )
+
+        self.n_ctx = n_ctx
+        self.token_cond = token_cond
+        self.cond_drop_prob = cond_drop_prob
+        self.context_dim = context_dim
+        self.use_pooled_embeddings = use_pooled_embeddings
+        self.max_seq_len = max_seq_len
+
+        # Trainable projection layer: BioMedCLIP (512) -> Transformer width
+        # This is the key new component for the "Surgery & Stitch" strategy
+        self.medical_projection = nn.Sequential(
+            nn.LayerNorm(context_dim, device=device, dtype=dtype),
+            nn.Linear(context_dim, self.backbone.width, device=device, dtype=dtype),
+        )
+
+        # Initialize projection layer with small values for stable fine-tuning
+        with torch.no_grad():
+            for module in self.medical_projection.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.normal_(module.weight, std=0.02)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+
+    def cached_model_kwargs(
+        self, batch_size: int, model_kwargs: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Cache the embeddings for faster sampling.
+        Since we use pre-computed BioMedCLIP embeddings, just pass them through.
+        """
+        return dict(embeddings=model_kwargs.get("embeddings"))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        embeddings: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass with BioMedCLIP text conditioning.
+        
+        Args:
+            x: Input tensor of shape [N x C x T] (point cloud latents).
+            t: Timestep tensor of shape [N].
+            embeddings: Pre-computed BioMedCLIP embeddings.
+                       If use_pooled_embeddings=True: [N x 512] pooled embeddings
+                       If use_pooled_embeddings=False: [N x seq_len x 512] sequence embeddings
+        
+        Returns:
+            Output tensor of shape [N x C' x T].
+        """
+        assert x.shape[-1] == self.n_ctx, f"Expected n_ctx={self.n_ctx}, got {x.shape[-1]}"
+
+        # Compute time embedding
+        t_embed = self.time_embed(timestep_embedding(t, self.backbone.width))
+
+        # Handle conditioning
+        if embeddings is not None:
+            # Apply classifier-free guidance dropout during training
+            if self.training and self.cond_drop_prob > 0:
+                mask = torch.rand(size=[len(x)], device=x.device) >= self.cond_drop_prob
+                if self.use_pooled_embeddings:
+                    embeddings = embeddings * mask[:, None].to(embeddings)
+                else:
+                    embeddings = embeddings * mask[:, None, None].to(embeddings)
+
+            # Project BioMedCLIP embeddings to transformer width
+            if self.use_pooled_embeddings:
+                # Pooled: [B, 512] -> [B, width]
+                # Rescale for unit variance (following original CLIP implementation)
+                embeddings = math.sqrt(embeddings.shape[-1]) * embeddings
+                medical_embed = self.medical_projection(embeddings)  # [B, width]
+                cond = [(medical_embed, self.token_cond), (t_embed, self.time_token_cond)]
+            else:
+                # Sequence: [B, seq_len, 512] -> [B, seq_len, width]
+                medical_embed = self.medical_projection(embeddings)  # [B, seq_len, width]
+                cond = [(t_embed, self.time_token_cond), (medical_embed, True)]
+        else:
+            # No conditioning - use zeros
+            if self.use_pooled_embeddings:
+                zero_embed = torch.zeros(
+                    x.shape[0], self.backbone.width, device=x.device, dtype=x.dtype
+                )
+                cond = [(zero_embed, self.token_cond), (t_embed, self.time_token_cond)]
+            else:
+                zero_embed = torch.zeros(
+                    x.shape[0], 1, self.backbone.width, device=x.device, dtype=x.dtype
+                )
+                cond = [(t_embed, self.time_token_cond), (zero_embed, True)]
+
+        return self._forward_with_cond(x, cond)
+
+    def get_trainable_projection_parameters(self) -> List[nn.Parameter]:
+        """
+        Get parameters of the medical projection layer for selective fine-tuning.
+        """
+        return list(self.medical_projection.parameters())
+
+    def get_attention_parameters(self) -> List[nn.Parameter]:
+        """
+        Get parameters of attention layers (for cross-attention fine-tuning).
+        In Shap-E's transformer, attention is in ResidualAttentionBlock.attn
+        """
+        params = []
+        for block in self.backbone.resblocks:
+            params.extend(block.attn.parameters())
+        return params
+
+    def freeze_for_finetuning(self):
+        """
+        Freeze all parameters except the medical projection and attention layers.
+        This implements the "Surgery & Stitch" fine-tuning strategy.
+        """
+        # First, freeze everything
+        for param in self.parameters():
+            param.requires_grad = False
+
+        # Unfreeze medical projection layer
+        for param in self.medical_projection.parameters():
+            param.requires_grad = True
+
+        # Unfreeze attention layers (for cross-attention adaptation)
+        for block in self.backbone.resblocks:
+            for param in block.attn.parameters():
+                param.requires_grad = True
+
+    def get_num_trainable_params(self) -> int:
+        """Get the number of trainable parameters."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def get_num_total_params(self) -> int:
+        """Get the total number of parameters."""
+        return sum(p.numel() for p in self.parameters())
